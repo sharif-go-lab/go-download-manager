@@ -1,0 +1,4 @@
+download_directory: "./downloads"
+max_concurrent_downloads: 3
+speed_limit_kbps: 0  # Example: 500 KBps max speed per download, 0 means no limit
+log_level: "info"
