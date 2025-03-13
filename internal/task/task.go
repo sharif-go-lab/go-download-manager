@@ -5,14 +5,12 @@ import (
 	"fmt"
 	"github.com/sharif-go-lab/go-download-manager/internal/utils"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type DownloadStatus int
@@ -30,9 +28,8 @@ type Task struct {
 	directoryPath string
 	status DownloadStatus
 
-	randomID string
 	fileSize int64
-	fileName string
+	filePath string
 
 	threads uint8
 	downloaded []uint64
@@ -41,46 +38,36 @@ type Task struct {
 	ctx context.Context
 	cancelFunc context.CancelFunc
 
-	speedLimit uint64 // bytes per second
 	retries uint8
+	limiter <-chan time.Time
 }
 
-func NewTask(url, directoryPath string, speedLimit uint64, threads, retires uint8) *Task {
-	if threads == 0 {
-		threads = 1
-	}
-
+func NewTask(url, directoryPath string, threads, retires uint8, limiter <-chan time.Time) *Task {
 	return &Task{
 		url: url,
 		status: Created,
+		retries: retires,
 		directoryPath: directoryPath,
-		randomID: uuid.New().String(),
 
 		fileSize: -1,
 		threads: threads,
+		limiter: limiter,
 		downloaded: make([]uint64, threads),
-
-		speedLimit: speedLimit,
-		retries: retires,
 	}
 }
 
 func (t *Task) start() {
-	logger := log.Default()
-
 	t.mutex.Lock()
 	if t.status == InProgress {
-		logger.Printf("task %s already started", t.randomID)
+		slog.Error("task already started")
 		t.mutex.Unlock()
 		return
-	}
-	if t.status == Completed {
-		logger.Printf("task %s already completed", t.randomID)
+	} else if t.status == Completed {
+		slog.Error("task already completed")
 		t.mutex.Unlock()
 		return
-	}
-	if t.status == Canceled {
-		logger.Printf("task %s already canceled", t.randomID)
+	} else if t.status == Canceled {
+		slog.Error("task already canceled")
 		t.mutex.Unlock()
 		return
 	}
@@ -89,27 +76,29 @@ func (t *Task) start() {
 	t.mutex.Unlock()
 
 	if t.fileSize == -1 {
-		for i := uint8(0); i <= t.retries; i++ {
+		for try := uint8(0); try <= t.retries; try++ {
 			resp, err := http.Head(t.url)
 			if err == nil {
-				t.fileName = utils.FileName(resp)
+				t.filePath = filepath.Join(t.directoryPath, utils.FileName(resp))
 				t.fileSize = resp.ContentLength
+
+				slog.Debug(fmt.Sprintf("task %s | retry %d | file size: %d", t.filePath, try, t.fileSize))
 				break
 			}
 
-			if i == t.retries {
-				logger.Printf("head url %s failed: %v", t.url, err)
+			if try == t.retries {
+				slog.Error(fmt.Sprintf("task %s | retry %d | head url %s failed: %v", t.filePath, try, t.url, err))
 				t.status = Failed
 				return
 			}
+			time.Sleep(time.Second * (1 << try))
 		}
 	}
 	chunkSize := t.fileSize / int64(t.threads)
 
-	filePath := filepath.Join(t.directoryPath, t.fileName)
-	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0666)
+	file, err := os.OpenFile(t.filePath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
-		logger.Printf("open file %s failed: %v", filePath, err)
+		slog.Error(fmt.Sprintf("task %s | open file failed: %v", t.filePath, err))
 		t.status = Failed
 		return
 	}
@@ -133,33 +122,33 @@ func (t *Task) start() {
 				if start > end {
 					break
 				}
+				slog.Debug(fmt.Sprintf("task %s | thread %d | retry %d | downloading part %d-%d...", t.filePath, i+1, try, start, end))
 
 				req, err := http.NewRequest("GET", t.url, nil)
 				if err != nil {
+					slog.Error(fmt.Sprintf("task %s | thread %d | retry %d | create request failed: %v", t.filePath, i+1, try, err))
 					return
 				}
 				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
+					slog.Error(fmt.Sprintf("task %s | thread %d | retry %d | send request failed: %v", t.filePath, i+1, try, err))
 					return
 				}
 				defer resp.Body.Close()
 
 				buffer := make([]byte, 1024)
-				var limiter <-chan time.Time
-				if t.speedLimit > 0 {
-					limiter = time.Tick(time.Second / time.Duration(t.speedLimit))
-				}
 				for {
 					select {
 					case <-t.ctx.Done():
+						slog.Debug(fmt.Sprintf("task %s | thread %d | retry %d | download cancelled", t.filePath, i+1, try))
 						return
 					default:
 						n, err := resp.Body.Read(buffer)
 						if n > 0 {
-							if limiter != nil {
-								<-limiter
+							if t.limiter != nil {
+								<-t.limiter
 							}
 
 							if _, err := file.WriteAt(buffer[:n], start); err != nil {
@@ -170,7 +159,9 @@ func (t *Task) start() {
 							start += int64(n)
 						}
 						if err == io.EOF {
-							break
+							slog.Debug(fmt.Sprintf("task %s | thread %d | retry %d | download finished!", t.filePath, i+1, try))
+							done[i] = true
+							return
 						}
 						if err != nil {
 							return
@@ -178,20 +169,33 @@ func (t *Task) start() {
 					}
 				}
 			}
-
-			done[i] = true
 		}(i)
 	}
 
+	ch := make(chan struct{})
+	go func(ch chan struct{}) {
+		for {
+			select {
+			case <-ch:
+				return
+			default:
+				slog.Info(fmt.Sprintf("task %s | downloading %.2f%%...", t.filePath, float64(t.downloaded[0])/float64(t.fileSize)*100))
+				time.Sleep(time.Second)
+			}
+		}
+	}(ch)
 	wg.Wait()
+	ch <- struct{}{}
+
 	for i := 0; i < int(t.threads); i++ {
 		if !done[i] {
-			logger.Printf("task %s failed on thread %d", t.randomID, i+1)
+			slog.Error(fmt.Sprintf("task %s | thread %d failed", t.filePath, i+1))
 			t.status = Failed
 			return
 		}
 	}
 	t.status = Completed
+	slog.Info(fmt.Sprintf("task %s | download finished!", t.filePath))
 }
 
 func (t *Task) Pause() {
@@ -199,13 +203,19 @@ func (t *Task) Pause() {
 	if t.status == InProgress {
 		t.cancelFunc()
 		t.status = Paused
+		slog.Info(fmt.Sprintf("task %s | paused", t.filePath))
 	}
 	t.mutex.Unlock()
 }
 
 func (t *Task) Resume() {
 	t.mutex.Lock()
-	if t.status == Paused {
+	if t.status == Paused || t.status == Created {
+		if t.status == Created {
+			slog.Info("new task started!")
+		} else {
+			slog.Info(fmt.Sprintf("task %s | resumed", t.filePath))
+		}
 		go t.start()
 	}
 	t.mutex.Unlock()
@@ -219,8 +229,13 @@ func (t *Task) Cancel() {
 		}
 		t.status = Canceled
 		go os.Remove(t.filePath)
+		slog.Info(fmt.Sprintf("task %s | canceled", t.filePath))
 	}
 	t.mutex.Unlock()
+}
+
+func (t *Task) Url() string {
+	return t.url
 }
 
 func (t *Task) Status() DownloadStatus {
