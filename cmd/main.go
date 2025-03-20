@@ -15,12 +15,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	// Replace these with your actual local imports:
+	// Your real local imports:
 	"github.com/sharif-go-lab/go-download-manager/internal/queue"
 	"github.com/sharif-go-lab/go-download-manager/internal/task"
 )
 
-// ----- Styles ----------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Styles
+// -----------------------------------------------------------------------------
 
 var (
 	tabBorder        = lipgloss.Border{Top: "─", Bottom: "─", Left: "│", Right: "│", TopLeft: "╭", TopRight: "╮", BottomLeft: "╰", BottomRight: "╯"}
@@ -32,11 +34,57 @@ var (
 	statusBarStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	titleStyle       = lipgloss.NewStyle().Background(lipgloss.Color("205")).Foreground(lipgloss.Color("0")).Padding(0, 1)
-	buttonStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Padding(0, 3)
 	highlightColor   = lipgloss.Color("205")
 )
 
-// ----- Key Map ----------------------------------------------------------------
+type queuedTask struct {
+	queue *queue.Queue
+	task      *task.Task
+}
+
+func (m Model) getAllDownloads() []queuedTask {
+	var result []queuedTask
+	for _, rq := range m.realQueues {
+		for _, t := range rq.Tasks() {
+			result = append(result, queuedTask{
+				queue: rq, // or rq.Name()
+				task:      t,
+			})
+		}
+	}
+	return result
+}
+
+func formatSpeed(bps uint64) string {
+	// bps = bytes per second
+	if bps < 1024 {
+		return fmt.Sprintf("%d B/s", bps)
+	} else if bps < 1024*1024 {
+		return fmt.Sprintf("%.1f KB/s", float64(bps)/1024.0)
+	} else if bps < 1024*1024*1024 {
+		return fmt.Sprintf("%.1f MB/s", float64(bps)/(1024.0*1024.0))
+	}
+	return fmt.Sprintf("%.1f GB/s", float64(bps)/(1024.0*1024.0*1024.0))
+}
+
+func (m *Model) updateSpeeds() {
+	// Build a list of all tasks from all queues:
+	for _, rq := range m.realQueues {
+		for _, t := range rq.Tasks() {
+			current := t.Downloaded()
+			prev := m.prevDownloaded[t]
+			diff := current - prev // bytes downloaded in last second
+
+			m.speeds[t] = diff // bytes/sec
+			m.prevDownloaded[t] = current
+		}
+	}
+}
+
+//--------------------------------------------
+// -----------------------------------------------------------------------------
+// Key Map
+// -----------------------------------------------------------------------------
 
 type KeyMap struct {
 	Tab1        key.Binding
@@ -53,6 +101,7 @@ type KeyMap struct {
 	Up          key.Binding
 	Down        key.Binding
 	Left        key.Binding
+	Right       key.Binding
 	Tab         key.Binding
 	Help        key.Binding
 	Quit        key.Binding
@@ -90,7 +139,7 @@ func DefaultKeyMap() KeyMap {
 		),
 		Retry: key.NewBinding(
 			key.WithKeys("r"),
-			key.WithHelp("r", "retry failed"),
+			key.WithHelp("r", "retry"),
 		),
 		EditQueue: key.NewBinding(
 			key.WithKeys("e"),
@@ -114,7 +163,11 @@ func DefaultKeyMap() KeyMap {
 		),
 		Left: key.NewBinding(
 			key.WithKeys("left"),
-			key.WithHelp("←", "prev tab"),
+			key.WithHelp("←", "left"),
+		),
+		Right: key.NewBinding(
+			key.WithKeys("right"),
+			key.WithHelp("→", "right"),
 		),
 		Tab: key.NewBinding(
 			key.WithKeys("tab"),
@@ -138,7 +191,7 @@ func (k KeyMap) ShortHelp() []key.Binding {
 func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Tab1, k.Tab2, k.Tab3},
-		{k.Up, k.Down, k.Left, k.Tab},
+		{k.Up, k.Down, k.Left, k.Right, k.Tab},
 		{k.Enter, k.Escape},
 		{k.Delete, k.PauseResume, k.Retry},
 		{k.EditQueue, k.DeleteQueue, k.AddQueue},
@@ -146,86 +199,115 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 	}
 }
 
-// ----- Queue Integration ------------------------------------------------------
+// -----------------------------------------------------------------------------
+// tickMsg for periodic refresh
+// -----------------------------------------------------------------------------
 
-// We'll maintain a single "default" queue that runs in the background.
-var defaultQueue *queue.Queue
-
-// tickMsg is a message used so we can refresh the UI periodically.
 type tickMsg time.Time
 
-// ----- Bubble Tea Model -------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Model
+// -----------------------------------------------------------------------------
 
 type Model struct {
-	tabs      []string
-	activeTab int
 	width     int
 	height    int
 	keys      KeyMap
 	help      help.Model
 	showHelp  bool
-	mu        sync.Mutex
-	// Tab 1: Add Download form fields
-	urlInput      textinput.Model
-	folderInput   textinput.Model
-	filenameInput textinput.Model
-	addFormFocus  int
+	activeTab int
 
-	// Which download is selected in the Downloads List tab
-	selectedDownload int
+	// We'll keep a slice of real queues:
+	realQueues    []*queue.Queue
+	selectedQueue int // which queue is selected in the Queues List
+	mu            sync.Mutex
 
-	// Tab 3: “Queues”
-	queues        []QueueUI
-	selectedQueue int
+	// Tab 1: Add Download
+	urlInput         textinput.Model
+	folderInput      textinput.Model
+	filenameInput    textinput.Model
+	addFormFocus     int  // 0=URL,1=Queue selection,2=Folder,3=Filename
+	selectedQForAdd  int  // which queue is chosen for the new download
+	creatingDownload bool // not strictly needed, but a simple state marker
 
-	// For editing queue settings
-	editQueueMode      bool
-	editQueueIndex     int
-	queueEditFormFocus int
-	queueNameInput     textinput.Model
-	queueFolderInput   textinput.Model
-	queueMaxDlInput    textinput.Model
-	queueSpeedInput    textinput.Model
-	queueTimeInput     textinput.Model
+	// Tab 2: Downloads
+	selectedDownload int // index into the combined tasks of all queues
 
-	errorMsg string
+	// Tab 3: "Queues UI" (lightweight info for each queue)
+	queues           []QueueUI
+	editQueueMode    bool
+	editQueueIndex   int
+	queueEditFocus   int
+	queueNameInput   textinput.Model
+	queueFolderInput textinput.Model
+	queueMaxDlInput  textinput.Model
+	queueSpeedInput  textinput.Model
+	queueTimeInput   textinput.Model
+	// For speed tracking:
+	prevDownloaded map[*task.Task]uint64 // how many bytes were downloaded at last tick
+	speeds         map[*task.Task]uint64 // current speed in bytes/s for each task
+	errorMsg       string
 }
 
-// QueueUI is a lightweight struct for the UI. If you want multiple queue.Queue
-// objects, you can store them similarly here and keep references to each queue.
+// QueueUI is a minimal struct that parallels the real queues in `m.realQueues`.
 type QueueUI struct {
 	Name         string
 	Folder       string
 	MaxDownloads int
-	SpeedLimit   string
-	Threads      uint8
+	SpeedLimit   uint64
 	TimeWindow   string
 }
 
-// initialModel configures everything at startup.
-func initialModel() Model {
-	// Create the defaultQueue from the internal/queue code
-	defaultQueue = queue.NewQueue(
-		"Downloads",
-		3,   // MaxDownloads
-		2,   // Threads
-		3,   // Retries
-		0,   // speedLimit => 0 = "unlimited"
-		nil, // no time interval
-	)
-	go defaultQueue.Run() // Start running it in the background
+// -----------------------------------------------------------------------------
+// init Model
+// -----------------------------------------------------------------------------
 
+func initialModel() Model {
+	// Create some example queues for demonstration
+	q1 := queue.NewQueue("Default", "~/Downloads", 3, 2, 3, 0, nil)
+	//q1.SetDirectory("~/Downloads")
+	go q1.Run()
+
+	//q2 := queue.NewQueue("Videos", "~/Documents", 2, 3, 2, 0, nil)
+	//q2.SetDirectory("VideosFolder")
+	//go q2.Run()
+
+	// If you have any more, add them here:
+	// q3 := ...
+	// go q3.Run()
+
+	realQueues := []*queue.Queue{q1}
+
+	// Build a parallel UI slice:
+	queuesUI := []QueueUI{
+		{
+			Name:         q1.Name,
+			Folder:       q1.Directory,
+			MaxDownloads: int(q1.MaxDownloads),
+			SpeedLimit:   q1.SpeedLimit,
+			TimeWindow:   "Always",
+		},
+		//{
+		//	Name:         q2.Name,
+		//	Folder:       q2.Directory,
+		//	MaxDownloads: int(q2.MaxDownloads),
+		//	SpeedLimit:   q2.SpeedLimit,
+		//	TimeWindow:   "Always",
+		//},
+	}
+
+	// Prepare text inputs
 	urlInput := textinput.New()
-	urlInput.Placeholder = "https://..."
+	urlInput.Placeholder = "https://example.com/file.zip"
 	urlInput.Focus()
 
 	folderInput := textinput.New()
-	folderInput.Placeholder = "Select destination folder"
+	folderInput.Placeholder = "(Optional) Save to folder"
 
 	filenameInput := textinput.New()
-	filenameInput.Placeholder = "Output filename (optional)"
+	filenameInput.Placeholder = "(Optional) Custom filename"
 
-	// Prepare text inputs for editing queue settings
+	// For editing queue settings
 	queueNameInput := textinput.New()
 	queueNameInput.Placeholder = "Queue Name"
 
@@ -245,42 +327,60 @@ func initialModel() Model {
 	helpModel := help.New()
 	helpModel.ShowAll = false
 
-	// Example local queues for the Tab 3 UI
-	var queues []QueueUI
-	queues = append(queues, QueueUI{
-		Name:         "Default",
-		Folder:       "Downloads",
-		MaxDownloads: 3,
-		SpeedLimit:   "Unlimited",
-		Threads:      3,
-		TimeWindow:   "Always",
-	})
-
 	return Model{
-		mu: sync.Mutex{},
-		tabs:               []string{"Add Download", "Downloads List", "Queues List"},
-		activeTab:          0,
-		keys:               keys,
-		help:               helpModel,
-		urlInput:           urlInput,
-		folderInput:        folderInput,
-		filenameInput:      filenameInput,
-		addFormFocus:       0,
-		selectedDownload:   0,
-		queues:             queues,
-		selectedQueue:      0,
-		editQueueMode:      false,
-		editQueueIndex:     -1,
-		queueEditFormFocus: 0,
-		queueNameInput:     queueNameInput,
-		queueFolderInput:   queueFolderInput,
-		queueMaxDlInput:    queueMaxDlInput,
-		queueSpeedInput:    queueSpeedInput,
-		queueTimeInput:     queueTimeInput,
+		keys:       keys,
+		help:       helpModel,
+		showHelp:   false,
+		activeTab:  0,
+		realQueues: realQueues,
+		queues:     queuesUI,
+		mu:         sync.Mutex{},
+
+		// Tab 1 (Add)
+		urlInput:      urlInput,
+		folderInput:   folderInput,
+		filenameInput: filenameInput,
+		addFormFocus:  0,
+		// selectedQForAdd = 0 means queue #0 is chosen by default
+
+		// Tab 2 (Downloads)
+		selectedDownload: 0,
+
+		// Tab 3 (Queues)
+		selectedQueue:    0,
+		editQueueMode:    false,
+		editQueueIndex:   -1,
+		queueEditFocus:   0,
+		queueNameInput:   queueNameInput,
+		queueFolderInput: queueFolderInput,
+		queueMaxDlInput:  queueMaxDlInput,
+		queueSpeedInput:  queueSpeedInput,
+		queueTimeInput:   queueTimeInput,
+		prevDownloaded: make(map[*task.Task]uint64),
+		speeds:         make(map[*task.Task]uint64),
 	}
 }
 
-// We schedule periodic ticks so we can update the UI with fresh progress info.
+func main() {
+	// Example logger at error-level
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelError)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+	slog.SetDefault(logger)
+
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Println("Error running program:", err)
+		os.Exit(1)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Tea Lifecycle
+// -----------------------------------------------------------------------------
+
 func (m Model) Init() tea.Cmd {
 	return tea.Every(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -292,76 +392,80 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-
 	case tickMsg:
-		// On each tick, we just refresh the UI with new progress.
+		// refresh the UI
+		m.updateSpeeds()
 		return m, tea.Every(time.Second, func(t time.Time) tea.Msg {
 			return tickMsg(t)
 		})
-
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, m.keys.Quit):
-			defaultQueue.Stop()
-			return m, tea.Quit
-
-		case key.Matches(msg, m.keys.Help):
-			m.showHelp = !m.showHelp
-
-		case key.Matches(msg, m.keys.Tab1):
-			m.activeTab = 0
-			m.addFormFocus = 0
-			m.urlInput.Focus()
-
-		case key.Matches(msg, m.keys.Tab2):
-			m.activeTab = 1
-
-		case key.Matches(msg, m.keys.Tab3):
-			m.activeTab = 2
-
-		case key.Matches(msg, m.keys.Tab):
-			// Basic next-tab
-			m.activeTab++
-			if m.activeTab >= len(m.tabs) {
-				m.activeTab = 0
-			}
-
-		default:
-			// If we are in editQueueMode, we handle that first (so it “overrides” normal tab inputs).
-			if m.editQueueMode {
-				m, cmd = m.updateEditQueueInputs(msg)
-				cmds = append(cmds, cmd)
-				return m, tea.Batch(cmds...)
-			}
-
-			// Otherwise, handle per-tab logic:
-			switch m.activeTab {
-			case 0:
-				m, cmd = m.updateAddDownloadTab(msg)
-				cmds = append(cmds, cmd)
-
-			case 1:
-				m = m.updateDownloadsListTab(msg)
-
-			case 2:
-				m = m.updateQueuesListTab(msg)
-			}
-		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		m.help.Width = msg.Width
-	}
+		return m, nil
 
+	case tea.KeyMsg:
+		m.errorMsg = ""
+		switch {
+		case key.Matches(msg, m.keys.Quit):
+			// Stop all real queues
+			for _, rq := range m.realQueues {
+				rq.Stop()
+			}
+			return m, tea.Quit
+
+		case key.Matches(msg, m.keys.Help):
+			m.showHelp = !m.showHelp
+
+		// Tabs by function keys
+		case key.Matches(msg, m.keys.Tab1):
+			m.activeTab = 0
+			m.addFormFocus = 0
+			m.urlInput.Focus()
+		case key.Matches(msg, m.keys.Tab2):
+			m.activeTab = 1
+		case key.Matches(msg, m.keys.Tab3):
+			m.activeTab = 2
+
+		// "Tab" to cycle tabs
+		case key.Matches(msg, m.keys.Tab):
+			m.activeTab++
+			if m.activeTab >= 3 {
+				m.activeTab = 0
+			}
+		}
+
+		// If we're editing a queue (Tab 3 / E) we handle that first
+		if m.editQueueMode {
+			m, cmd = m.updateEditQueue(msg)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+
+		// Otherwise handle per-tab logic
+		switch m.activeTab {
+		case 0:
+			m, cmd = m.updateTabAdd(msg)
+			cmds = append(cmds, cmd)
+
+		case 1:
+			m = m.updateTabDownloads(msg)
+
+		case 2:
+			m = m.updateTabQueues(msg)
+		}
+
+	}
 	return m, tea.Batch(cmds...)
 }
 
-// ----- Update Logic for each tab ---------------------------------------------
+// -----------------------------------------------------------------------------
+// Update logic: Tab 0 (Add Download)
+// -----------------------------------------------------------------------------
 
-func (m Model) updateAddDownloadTab(msg tea.Msg) (Model, tea.Cmd) {
+func (m Model) updateTabAdd(msg tea.Msg) (Model, tea.Cmd) {
 	var cmd tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
@@ -371,43 +475,65 @@ func (m Model) updateAddDownloadTab(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Down):
 			m.addFormFocus = min(2, m.addFormFocus+1)
 
+		case key.Matches(msg, m.keys.Left):
+			// If we are on the queue selection row, pressing left changes the queue
+			if m.addFormFocus == 1 && len(m.realQueues) > 1 {
+				m.selectedQForAdd--
+				if m.selectedQForAdd < 0 {
+					m.selectedQForAdd = len(m.realQueues) - 1
+				}
+			}
+		case key.Matches(msg, m.keys.Right):
+			// If we are on the queue selection row, pressing right changes the queue
+			if m.addFormFocus == 1 && len(m.realQueues) > 1 {
+				m.selectedQForAdd++
+				if m.selectedQForAdd >= len(m.realQueues) {
+					m.selectedQForAdd = 0
+				}
+			}
+
 		case key.Matches(msg, m.keys.Enter):
+			// If not yet at last field, move forward
 			if m.addFormFocus < 2 {
-				// Move to next input
 				m.addFormFocus++
 			} else {
-				// On the third field (filename), press Enter => add the download
+				// On last field => attempt to add
 				if m.urlInput.Value() == "" {
-					m.errorMsg = "URL is required."
+					m.errorMsg = "URL is required"
 				} else {
-					defaultQueue.AddTask(m.urlInput.Value())
-
-					// You could pass folder/filename to your queue if you extend the queue/task code.
-					// For now, we just demonstrate adding by URL.
+					// Add to whichever queue is selected
+					if m.selectedQForAdd < len(m.realQueues) {
+						chosenQ := m.realQueues[m.selectedQForAdd]
+						chosenQ.AddTask(m.urlInput.Value(), m.folderInput.Value())
+						// If your queue supports specifying folder/filename, pass them too:
+						// chosenQ.AddTaskWithDetails(m.urlInput.Value(), m.folderInput.Value(), m.filenameInput.Value())
+					}
 
 					// Reset
 					m.urlInput.Reset()
 					m.folderInput.Reset()
 					m.filenameInput.Reset()
-					m.addFormFocus = 0
 					m.urlInput.Focus()
+					m.addFormFocus = 0
+					m.selectedQForAdd = 0
 
-					// Switch to downloads tab to see it
+					// Switch to downloads tab
 					m.activeTab = 1
 				}
 			}
 
 		case key.Matches(msg, m.keys.Escape):
-			// Reset the form
+			// reset
 			m.urlInput.Reset()
 			m.folderInput.Reset()
 			m.filenameInput.Reset()
 			m.urlInput.Focus()
 			m.addFormFocus = 0
+			m.selectedQForAdd = 0
 		}
 	}
 
-	// Update whichever text field is focused
+	// Update whichever textinput is in focus
 	switch m.addFormFocus {
 	case 0:
 		m.urlInput.Focus()
@@ -415,173 +541,230 @@ func (m Model) updateAddDownloadTab(msg tea.Msg) (Model, tea.Cmd) {
 		m.filenameInput.Blur()
 		m.urlInput, cmd = m.urlInput.Update(msg)
 	case 1:
+		// The "queue selection" row is not a textinput,
+		// so we only handle left/right keys above.
+		m.urlInput.Blur()
+		m.folderInput.Blur()
+		m.filenameInput.Blur()
+	case 2:
 		m.urlInput.Blur()
 		m.folderInput.Focus()
 		m.filenameInput.Blur()
 		m.folderInput, cmd = m.folderInput.Update(msg)
-	case 2:
-		m.urlInput.Blur()
-		m.folderInput.Blur()
-		m.filenameInput.Focus()
-		m.filenameInput, cmd = m.filenameInput.Update(msg)
+		//case 3:
+		//	m.urlInput.Blur()
+		//	m.folderInput.Blur()
+		//	m.filenameInput.Focus()
+		//	m.filenameInput, cmd = m.filenameInput.Update(msg)
 	}
-
 	return m, cmd
 }
 
-func (m Model) updateDownloadsListTab(msg tea.Msg) Model {
-	tasks := defaultQueue.Tasks()
+// -----------------------------------------------------------------------------
+// Update logic: Tab 1 (Downloads)
+// -----------------------------------------------------------------------------
 
+func (m Model) updateTabDownloads(msg tea.Msg) Model {
+	// We gather tasks from all queues and let the user pick one by index
+	//var allTasks []*task.Task
+	//for _, rq := range m.realQueues {
+	//	allTasks = append(allTasks, rq.Tasks()...)
+	//}
+	allTasks := m.getAllDownloads()
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Up):
 			m.selectedDownload = max(0, m.selectedDownload-1)
-
 		case key.Matches(msg, m.keys.Down):
-			m.selectedDownload = min(len(tasks)-1, m.selectedDownload+1)
+			m.selectedDownload = min(len(allTasks)-1, m.selectedDownload+1)
 
 		case key.Matches(msg, m.keys.Delete):
-			if len(tasks) > 0 && m.selectedDownload < len(tasks) {
-				tasks[m.selectedDownload].Cancel()
+			if len(allTasks) > 0 && m.selectedDownload < len(allTasks) {
+				allTasks[m.selectedDownload].task.Cancel()
 			}
 
 		case key.Matches(msg, m.keys.PauseResume):
-			if len(tasks) > 0 && m.selectedDownload < len(tasks) {
-				t := tasks[m.selectedDownload]
-				switch t.Status() {
+			if len(allTasks) > 0 && m.selectedDownload < len(allTasks) {
+				t := allTasks[m.selectedDownload]
+				switch t.task.Status() {
 				case task.InProgress:
-					t.Pause()
-					break
+					t.task.Pause()
 				case task.Paused, task.Pending:
-					t.Resume()
-					break
+					t.task.Resume()
 				case task.Failed:
 					// treat as a “retry”
-					t.Resume()
-					break
+					//t.task.Cancel()
+					t.queue.AddTask(t.task.Url(),t.task.DirectoryPath)
+
+
 				}
 			}
 
 		case key.Matches(msg, m.keys.Retry):
-			if len(tasks) > 0 && m.selectedDownload < len(tasks) {
-				t := tasks[m.selectedDownload]
-				t.Cancel()
+			if len(allTasks) > 0 && m.selectedDownload < len(allTasks) {
+				t := allTasks[m.selectedDownload]
+				//if t.task.Status() == task.Failed {
+				t.task.Cancel()
+				//t.task.Resume()
+				t.queue.AddTask(t.task.Url(),t.task.DirectoryPath)
+				//}
 			}
 		}
 	}
 	return m
 }
 
-func (m Model) updateQueuesListTab(msg tea.Msg) Model {
+// -----------------------------------------------------------------------------
+// Update logic: Tab 2 (Queues)
+// -----------------------------------------------------------------------------
+
+func (m Model) updateTabQueues(msg tea.Msg) Model {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Up):
 			m.selectedQueue = max(0, m.selectedQueue-1)
-
 		case key.Matches(msg, m.keys.Down):
 			m.selectedQueue = min(len(m.queues)-1, m.selectedQueue+1)
 
 		case key.Matches(msg, m.keys.DeleteQueue):
-			if len(m.queues) > 0 && m.selectedQueue < len(m.queues) {
-				m.queues = append(m.queues[:m.selectedQueue], m.queues[m.selectedQueue+1:]...)
+			if m.selectedQueue < len(m.realQueues) {
+				// Stop & remove from realQueues
+				toRemove := m.realQueues[m.selectedQueue]
+				toRemove.Stop()
+
+				m.realQueues = append(m.realQueues[:m.selectedQueue],
+					m.realQueues[m.selectedQueue+1:]...)
+
+				// Remove from the UI slice
+				m.queues = append(m.queues[:m.selectedQueue],
+					m.queues[m.selectedQueue+1:]...)
+
 				if m.selectedQueue >= len(m.queues) {
 					m.selectedQueue = max(0, len(m.queues)-1)
 				}
 			}
 
 		case key.Matches(msg, m.keys.EditQueue):
-			if len(m.queues) > 0 && m.selectedQueue < len(m.queues) {
+			if m.selectedQueue < len(m.queues) {
 				m.editQueueMode = true
 				m.editQueueIndex = m.selectedQueue
-				m.queueEditFormFocus = 0
+				m.queueEditFocus = 0
 
-				// Populate the text fields from the selected queue
-				q := m.queues[m.selectedQueue]
-				m.queueNameInput.SetValue(q.Name)
-				m.queueFolderInput.SetValue(q.Folder)
-				m.queueMaxDlInput.SetValue(fmt.Sprintf("%d", q.MaxDownloads))
-				m.queueSpeedInput.SetValue(q.SpeedLimit)
-				m.queueTimeInput.SetValue(q.TimeWindow)
-
-				m.queueNameInput.Focus()
+				qUI := m.queues[m.selectedQueue]
+				m.queueNameInput.SetValue(qUI.Name)
+				m.queueFolderInput.SetValue(qUI.Folder)
+				m.queueMaxDlInput.SetValue(fmt.Sprintf("%d", qUI.MaxDownloads))
+				m.queueSpeedInput.SetValue(fmt.Sprintf("%d", qUI.SpeedLimit))
+				m.queueTimeInput.SetValue(qUI.TimeWindow)
 			}
 
 		case key.Matches(msg, m.keys.AddQueue):
-			newQ := QueueUI{
-				Name:         "New Queue",
-				Folder:       "/Downloads/New",
-				MaxDownloads: 2,
-				SpeedLimit:   "Unlimited",
+			// Create a brand new real queue
+			newRealQ := queue.NewQueue("NewQueue", "Downloads", 2, 2, 3, 0, nil)
+			//newRealQ.SetDirectory("~/Downloads")
+			go newRealQ.Run()
+
+			m.realQueues = append(m.realQueues, newRealQ)
+
+			// Also add to UI
+			m.queues = append(m.queues, QueueUI{
+				Name:         newRealQ.Name,
+				Folder:       newRealQ.Directory,
+				MaxDownloads: int(newRealQ.MaxDownloads),
+				SpeedLimit:   newRealQ.SpeedLimit,
 				TimeWindow:   "Always",
-			}
-			m.queues = append(m.queues, newQ)
+			})
 			m.selectedQueue = len(m.queues) - 1
 		}
 	}
 	return m
 }
 
-// ----- Edit Queue Mode -------------------------------------------------------
-// This handles the special “edit queue” form when the user has pressed E on Tab 3.
+// -----------------------------------------------------------------------------
+// Update logic: Editing a queue
+// -----------------------------------------------------------------------------
 
-func (m Model) updateEditQueueInputs(msg tea.Msg) (Model, tea.Cmd) {
+func (m Model) updateEditQueue(msg tea.Msg) (Model, tea.Cmd) {
 	var cmd tea.Cmd
-
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Up):
-			m.queueEditFormFocus = max(0, m.queueEditFormFocus-1)
-
+			m.queueEditFocus = max(0, m.queueEditFocus-1)
 		case key.Matches(msg, m.keys.Down):
-			m.queueEditFormFocus = min(4, m.queueEditFormFocus+1)
+			m.queueEditFocus = min(4, m.queueEditFocus+1)
 
 		case key.Matches(msg, m.keys.Enter):
-			if m.queueEditFormFocus < 4 {
-				// Move to next field
-				m.queueEditFormFocus++
+			if m.queueEditFocus < 4 {
+				m.queueEditFocus++
 			} else {
-				// On the last field, pressing Enter => Save changes
-				updated := m.queues[m.editQueueIndex]
+				// Save changes
+				if m.editQueueIndex >= 0 && m.editQueueIndex < len(m.realQueues) {
+					rQ := m.realQueues[m.editQueueIndex]
+					qUI := m.queues[m.editQueueIndex]
 
-				updated.Name = m.queueNameInput.Value()
-				updated.Folder = m.queueFolderInput.Value()
+					// name
+					newName := m.queueNameInput.Value()
+					rQ.SetName(newName)
+					qUI.Name = newName
 
-				// Safely parse the max downloads integer
-				maxDl, err := strconv.Atoi(m.queueMaxDlInput.Value())
-				if err != nil {
-					maxDl = 1
-				}
-				updated.MaxDownloads = maxDl
-				updated.SpeedLimit = m.queueSpeedInput.Value()
-				updated.TimeWindow = m.queueTimeInput.Value()
+					// folder
+					folder := m.queueFolderInput.Value()
+					err := rQ.SetDirectory(folder)
+					if err != nil {
+						m.errorMsg = err.Error()
+					} else {
+						qUI.Folder = folder
+					}
+					// max downloads
+					maxStr := m.queueMaxDlInput.Value()
+					maxDl, err := strconv.Atoi(maxStr)
+					if err == nil && maxDl > 0 {
+						rQ.SetMaxDownloads(uint8(maxDl))
+						qUI.MaxDownloads = maxDl
+					}
 
-				m.queues[m.editQueueIndex] = updated
+					// speed limit
+					speedStr := m.queueSpeedInput.Value()
+					speed, err2 := strconv.ParseInt(speedStr, 10, 64)
+					if err2 == nil && speed >= 0 {
+						rQ.SetSpeedLimit(uint64(speed))
+						qUI.SpeedLimit = uint64(speed)
+					}
 
-				// If this is the “defaultQueue” (index 0), also update that queue in real time
-				if m.editQueueIndex == 0 {
-					// We only do MaxDownloads as an example. You can expand for speed/time if queue supports it.
-					defaultQueue.MaxDownloads = uint8(maxDl)
+					// time window
+					timeWindowStr := m.queueTimeInput.Value()
+					// Attempt to parse & store in the real queue
+					err3 := rQ.SetActiveIntervalFromString(timeWindowStr)
+					if err3 != nil {
+						m.errorMsg = "Invalid time window: " + err3.Error()
+					} else {
+						qUI.TimeWindow = timeWindowStr
+					}
+					// For demonstration only
+					qUI.TimeWindow = m.queueTimeInput.Value()
+
+					// Save back to the UI slice
+					m.queues[m.editQueueIndex] = qUI
 				}
 
 				// Exit edit mode
 				m.editQueueMode = false
 				m.editQueueIndex = -1
-				m.queueEditFormFocus = 0
+				m.queueEditFocus = 0
 			}
 
 		case key.Matches(msg, m.keys.Escape):
-			// Cancel
 			m.editQueueMode = false
 			m.editQueueIndex = -1
-			m.queueEditFormFocus = 0
+			m.queueEditFocus = 0
 		}
 	}
 
-	// Update whichever queue field is focused
-	switch m.queueEditFormFocus {
+	// Update whichever text input is in focus
+	switch m.queueEditFocus {
 	case 0:
 		m.queueNameInput.Focus()
 		m.queueFolderInput.Blur()
@@ -618,71 +801,72 @@ func (m Model) updateEditQueueInputs(msg tea.Msg) (Model, tea.Cmd) {
 		m.queueTimeInput.Focus()
 		m.queueTimeInput, cmd = m.queueTimeInput.Update(msg)
 	}
-
 	return m, cmd
 }
 
-// ----- View Rendering ---------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Views
+// -----------------------------------------------------------------------------
 
 func (m Model) View() string {
-	doc := strings.Builder{}
+	var doc strings.Builder
 
-	// Tabs row
-	tabs := []string{}
-	for i, tab := range m.tabs {
+	// Tabs
+	var tabs []string
+	tabTitles := []string{"Add Download", "Downloads", "Queues"}
+	for i, t := range tabTitles {
 		if i == m.activeTab {
-			tabs = append(tabs, activeTabStyle.Render(tab))
+			tabs = append(tabs, activeTabStyle.Render(t))
 		} else {
-			tabs = append(tabs, inactiveTabStyle.Render(tab))
+			tabs = append(tabs, inactiveTabStyle.Render(t))
 		}
 	}
-	row := lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
-	doc.WriteString(row + "\n\n")
+	doc.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, tabs...) + "\n\n")
 
-	// Content area
 	var content string
 	if m.editQueueMode {
-		content = m.renderEditQueueForm()
+		content = m.viewEditQueueForm()
 	} else {
 		switch m.activeTab {
 		case 0:
-			content = m.renderAddDownloadTab()
+			content = m.viewTabAdd()
 		case 1:
-			content = m.renderDownloadsListTab()
+			content = m.viewTabDownloads()
 		case 2:
-			content = m.renderQueuesListTab()
+			content = m.viewTabQueues()
 		}
 	}
 
 	windowContent := windowStyle.Width(m.width - 10).Render(content)
 	doc.WriteString(windowContent + "\n\n")
 
-	// Error message
+	// Error
 	if m.errorMsg != "" {
-		doc.WriteString(lipgloss.NewStyle().
-			Foreground(lipgloss.Color("9")).
-			Render(m.errorMsg) + "\n\n")
+		doc.WriteString(
+			lipgloss.NewStyle().Foreground(lipgloss.Color("9")).
+				Render(m.errorMsg) + "\n\n")
 	}
 
-	// Help or status bar
+	// Show help or quick status
 	helpView := m.help.View(m.keys)
 	if m.showHelp {
 		doc.WriteString(helpStyle.Render(helpView))
 	} else {
-		statusBar := "F1:Add F2:Downloads F3:Queues | Press ? for help"
-		doc.WriteString(statusBarStyle.Render(statusBar))
+		doc.WriteString(statusBarStyle.Render("F1:Add  F2:Downloads  F3:Queues  ?=Help"))
 	}
 
 	return docStyle.Render(doc.String())
 }
 
-// ----- Renders for each tab ---------------------------------------------------
+// -----------------------------------------------------------------------------
+// View: Tab 0 (Add)
+// -----------------------------------------------------------------------------
 
-func (m Model) renderAddDownloadTab() string {
+func (m Model) viewTabAdd() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(" Add New Download ") + "\n\n")
 
-	// URL field
+	// 0) URL
 	urlLabel := "URL (required): "
 	if m.addFormFocus == 0 {
 		urlLabel = "> " + urlLabel
@@ -691,77 +875,120 @@ func (m Model) renderAddDownloadTab() string {
 	}
 	b.WriteString(urlLabel + m.urlInput.View() + "\n\n")
 
-	// Folder field
-	folderLabel := "Destination Folder: "
+	// 1) Queue selection
+	queueLabel := "Select Queue: "
 	if m.addFormFocus == 1 {
+		queueLabel = "> " + queueLabel
+	} else {
+		queueLabel = "  " + queueLabel
+	}
+	chosenQueueName := ""
+	if m.selectedQForAdd < len(m.realQueues) {
+		chosenQueueName = m.realQueues[m.selectedQForAdd].Name
+	}
+	b.WriteString(fmt.Sprintf("%s[ %s ]  (←/→ to change)\n\n", queueLabel, chosenQueueName))
+
+	// 2) Folder
+	folderLabel := "Folder (optional): "
+	if m.addFormFocus == 2 {
 		folderLabel = "> " + folderLabel
 	} else {
 		folderLabel = "  " + folderLabel
 	}
 	b.WriteString(folderLabel + m.folderInput.View() + "\n\n")
 
-	// Filename field
-	filenameLabel := "Output Filename (optional): "
-	if m.addFormFocus == 2 {
-		filenameLabel = "> " + filenameLabel
-	} else {
-		filenameLabel = "  " + filenameLabel
-	}
-	b.WriteString(filenameLabel + m.filenameInput.View() + "\n\n")
+	// 3) Filename
+	//fileLabel := "Filename (optional): "
+	//if m.addFormFocus == 3 {
+	//	fileLabel = "> " + fileLabel
+	//} else {
+	//	fileLabel = "  " + fileLabel
+	//}
+	//b.WriteString(fileLabel + m.filenameInput.View() + "\n\n")
 
-	b.WriteString("Use Up/Down to move, Enter to proceed. Esc to reset/cancel.\n")
+	b.WriteString("Up/Down to navigate fields, Enter to proceed, Esc to cancel.\n")
 	return b.String()
 }
 
-func (m Model) renderDownloadsListTab() string {
-	b := strings.Builder{}
+// -----------------------------------------------------------------------------
+// View: Tab 1 (Downloads)
+// -----------------------------------------------------------------------------
 
-	b.WriteString(titleStyle.Render(" Downloads List ") + "\n\n")
-	b.WriteString(fmt.Sprintf("%-38s %-12s %-15s %s\n", "URL", "Status", "Progress", "Downloaded"))
-	b.WriteString(strings.Repeat("─", 80) + "\n")
 
-	tasks := defaultQueue.Tasks()
-	for i, t := range tasks {
+//  Render “Queue” AND “Speed” in your downloads tab:
+func (m Model) viewTabDownloads() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(" Downloads ") + "\n\n")
+
+	allTasks := m.getAllDownloads() // queuedTask objects
+
+	// We have “Queue” + “URL” + “Status” + “Progress” + “Speed” + “Downloaded”
+	b.WriteString(fmt.Sprintf(
+		"%-10s %-36s %-12s %-15s %-10s %s\n",
+		"Queue",    // 10 chars wide
+		"URL",      // 36 chars wide
+		"Status",   // 12 chars
+		"Progress", // 15 chars
+		"Speed",    // 10 chars
+		"Downloaded",
+	))
+	b.WriteString(strings.Repeat("─", 100) + "\n")
+
+	for i, item := range allTasks {
 		prefix := "  "
 		if i == m.selectedDownload {
 			prefix = "> "
 		}
+		t := item.task
 
+		queueName := truncateString(item.queue.Name, 10)
+		urlStr    := truncateString(t.Url(), 36)
 		statusStr := statusToString(t.Status())
-		totalSize := t.TotalSize()
+
+		total      := t.TotalSize()
 		downloaded := t.Downloaded()
-		progress := 0.0
-		if totalSize > 0 {
-			progress = float64(downloaded) / float64(totalSize)
+		progress   := 0.0
+		if total > 0 {
+			progress = float64(downloaded) / float64(total)
 		}
 
-		line := fmt.Sprintf("%s%-38s %-12s %-15s %s",
-			prefix,
-			truncateString(t.Url(), 38),
-			statusStr,
-			renderProgressBar(progress, 15),
-			fmt.Sprintf("%d/%d bytes", downloaded, totalSize),
-		)
+		// speed is from your m.speeds map:
+		speedBps := m.speeds[t]
+		speedStr := formatSpeed(speedBps) // "KB/s" etc.
 
+		line := fmt.Sprintf("%s%-10s %-36s %-12s %-15s %-10s %s",
+			prefix,
+			queueName,                  // queue column
+			urlStr,                     // url column
+			statusStr,                  // status
+			renderProgressBar(progress, 15),
+			speedStr,                   // speed column
+			fmt.Sprintf("%d/%d bytes", downloaded, total),
+		)
 		if i == m.selectedDownload {
 			line = lipgloss.NewStyle().Foreground(highlightColor).Render(line)
 		}
+
 		b.WriteString(line + "\n")
 	}
 
-	if len(tasks) == 0 {
-		b.WriteString("\n  No downloads yet. Press F1 to add a download.\n")
+	if len(allTasks) == 0 {
+		b.WriteString("\nNo tasks. Press F1 to add.\n")
 	}
-	b.WriteString("\nPress D to cancel/remove, P to pause/resume, R to retry\n")
+	b.WriteString("\nD=Cancel, P=Pause/Resume, R=Retry failed\n")
 	return b.String()
 }
 
-func (m Model) renderQueuesListTab() string {
-	b := strings.Builder{}
-	b.WriteString(titleStyle.Render(" Download Queues ") + "\n\n")
+// -----------------------------------------------------------------------------
+// View: Tab 2 (Queues)
+// -----------------------------------------------------------------------------
 
-	b.WriteString(fmt.Sprintf("%-15s %-20s %-15s %-15s %-15s\n",
-		"Name", "Folder", "MaxDls", "SpeedLimit", "TimeWindow"))
+func (m Model) viewTabQueues() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(" Queues ") + "\n\n")
+
+	b.WriteString(fmt.Sprintf("%-15s %-20s %-12s %-10s %-12s\n",
+		"Name", "Folder", "MaxDls", "Speed", "TimeWindow"))
 	b.WriteString(strings.Repeat("─", 80) + "\n")
 
 	for i, q := range m.queues {
@@ -769,8 +996,7 @@ func (m Model) renderQueuesListTab() string {
 		if i == m.selectedQueue {
 			prefix = "> "
 		}
-		line := fmt.Sprintf(
-			"%s%-15s %-20s %-15d %-15s %-15s",
+		line := fmt.Sprintf("%s%-15s %-20s %-12d %-10d %-12s",
 			prefix,
 			truncateString(q.Name, 15),
 			truncateString(q.Folder, 20),
@@ -785,119 +1011,71 @@ func (m Model) renderQueuesListTab() string {
 	}
 
 	if len(m.queues) == 0 {
-		b.WriteString("\n  No queues defined. Press N to add a new queue.\n")
+		b.WriteString("\nNo queues. Press N to add.\n")
+	} else {
+		b.WriteString("\nUp/Down=Select queue, E=Edit, D=Delete, N=Add\n")
 	}
-	b.WriteString("\nPress E to edit, D to delete, N to add a new queue\n")
 	return b.String()
 }
 
-// ----- Render Edit Queue Form ------------------------------------------------
+// -----------------------------------------------------------------------------
+// View: Edit Queue Form
+// -----------------------------------------------------------------------------
 
-func (m Model) renderEditQueueForm() string {
+func (m Model) viewEditQueueForm() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(" Edit Queue ") + "\n\n")
 
-	// Name
-	nameLabel := "Name:"
-	if m.queueEditFormFocus == 0 {
-		nameLabel = "> " + nameLabel
+	label := "Name:"
+	if m.queueEditFocus == 0 {
+		label = "> " + label
 	} else {
-		nameLabel = "  " + nameLabel
+		label = "  " + label
 	}
-	b.WriteString(nameLabel + " " + m.queueNameInput.View() + "\n\n")
+	b.WriteString(label + " " + m.queueNameInput.View() + "\n\n")
 
-	// Folder
-	folderLabel := "Folder:"
-	if m.queueEditFormFocus == 1 {
-		folderLabel = "> " + folderLabel
+	label = "Folder:"
+	if m.queueEditFocus == 1 {
+		label = "> " + label
 	} else {
-		folderLabel = "  " + folderLabel
+		label = "  " + label
 	}
-	b.WriteString(folderLabel + " " + m.queueFolderInput.View() + "\n\n")
+	b.WriteString(label + " " + m.queueFolderInput.View() + "\n\n")
 
-	// MaxDownloads
-	maxLabel := "Max Downloads:"
-	if m.queueEditFormFocus == 2 {
-		maxLabel = "> " + maxLabel
+	label = "Max Downloads:"
+	if m.queueEditFocus == 2 {
+		label = "> " + label
 	} else {
-		maxLabel = "  " + maxLabel
+		label = "  " + label
 	}
-	b.WriteString(maxLabel + " " + m.queueMaxDlInput.View() + "\n\n")
+	b.WriteString(label + " " + m.queueMaxDlInput.View() + "\n\n")
 
-	// SpeedLimit
-	speedLabel := "Speed Limit:"
-	if m.queueEditFormFocus == 3 {
-		speedLabel = "> " + speedLabel
+	label = "Speed Limit (KB/s):"
+	if m.queueEditFocus == 3 {
+		label = "> " + label
 	} else {
-		speedLabel = "  " + speedLabel
+		label = "  " + label
 	}
-	b.WriteString(speedLabel + " " + m.queueSpeedInput.View() + "\n\n")
+	b.WriteString(label + " " + m.queueSpeedInput.View() + "\n\n")
 
-	// TimeWindow
-	timeLabel := "Time Window:"
-	if m.queueEditFormFocus == 4 {
-		timeLabel = "> " + timeLabel
+	// Here’s the updated “Time Window” label, clarifying the format
+	label = "Time Window (HH:MM:SS-HH:MM:SS):"
+	if m.queueEditFocus == 4 {
+		label = "> " + label
 	} else {
-		timeLabel = "  " + timeLabel
+		label = "  " + label
 	}
-	b.WriteString(timeLabel + " " + m.queueTimeInput.View() + "\n\n")
+	b.WriteString(label + " " + m.queueTimeInput.View() + "\n\n")
 
-	b.WriteString("Use Up/Down to move, Enter to save on the last field, Esc to cancel.\n")
+	// Some quick instructions
+	b.WriteString("Example: 08:00:00-17:00:00 for an 8am-5pm window\n")
+	b.WriteString("Up/Down to navigate, Enter to save on last field, Esc=Cancel.\n")
 	return b.String()
 }
 
-// ----- Helpers ----------------------------------------------------------------
-
-func statusToString(s task.DownloadStatus) string {
-	switch s {
-	case task.Pending:
-		return "Pending"
-	case task.InProgress:
-		return "downloading"
-	case task.Paused:
-		return "paused"
-	case task.Completed:
-		return "completed"
-	case task.Canceled:
-		return "canceled"
-	case task.Failed:
-		return "failed"
-	default:
-		return "unknown"
-	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func renderProgressBar(progress float64, width int) string {
-	filled := int(progress * float64(width))
-	if filled > width {
-		filled = width
-	}
-	bar := strings.Builder{}
-	bar.WriteString("[")
-	for i := 0; i < width; i++ {
-		if i < filled {
-			bar.WriteString("=")
-		} else {
-			bar.WriteString(" ")
-		}
-	}
-	bar.WriteString("]")
-	return bar.String()
-}
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
@@ -906,19 +1084,52 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-// ----- main -------------------------------------------------------------------
-
-func main() {
-	level := new(slog.LevelVar)
-	level.Set(slog.LevelError)
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: level,
-	}))
-	slog.SetDefault(logger)
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Println("Error running program:", err)
-		os.Exit(1)
+func statusToString(s task.DownloadStatus) string {
+	switch s {
+	case task.Pending:
+		return "Pending"
+	case task.InProgress:
+		return "Downloading"
+	case task.Paused:
+		return "Paused"
+	case task.Completed:
+		return "Completed"
+	case task.Canceled:
+		return "Canceled"
+	case task.Failed:
+		return "Failed"
+	default:
+		return "Unknown"
 	}
+}
 
+func renderProgressBar(progress float64, width int) string {
+	filled := int(progress * float64(width))
+	if filled > width {
+		filled = width
+	}
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i := 0; i < width; i++ {
+		if i < filled {
+			sb.WriteString("=")
+		} else {
+			sb.WriteString(" ")
+		}
+	}
+	sb.WriteString("]")
+	return sb.String()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
