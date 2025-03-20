@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -21,39 +23,39 @@ import (
 // ----- Styles ----------------------------------------------------------------
 
 var (
-	tabBorder         = lipgloss.Border{Top: "─", Bottom: "─", Left: "│", Right: "│", TopLeft: "╭", TopRight: "╮", BottomLeft: "╰", BottomRight: "╯"}
-	activeTabBorder   = lipgloss.Border{Top: "─", Bottom: " ", Left: "│", Right: "│", TopLeft: "╭", TopRight: "╮", BottomLeft: "│", BottomRight: "│"}
-	docStyle          = lipgloss.NewStyle().Padding(1, 2)
-	inactiveTabStyle  = lipgloss.NewStyle().Border(tabBorder, true).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
-	activeTabStyle    = lipgloss.NewStyle().Border(activeTabBorder, true).BorderForeground(lipgloss.Color("205")).Padding(0, 1)
-	windowStyle       = lipgloss.NewStyle().Border(tabBorder).BorderForeground(lipgloss.Color("205")).Padding(2, 2)
-	statusBarStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	helpStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	titleStyle        = lipgloss.NewStyle().Background(lipgloss.Color("205")).Foreground(lipgloss.Color("0")).Padding(0, 1)
-	buttonStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Padding(0, 3)
-	highlightColor    = lipgloss.Color("205")
+	tabBorder        = lipgloss.Border{Top: "─", Bottom: "─", Left: "│", Right: "│", TopLeft: "╭", TopRight: "╮", BottomLeft: "╰", BottomRight: "╯"}
+	activeTabBorder  = lipgloss.Border{Top: "─", Bottom: " ", Left: "│", Right: "│", TopLeft: "╭", TopRight: "╮", BottomLeft: "│", BottomRight: "│"}
+	docStyle         = lipgloss.NewStyle().Padding(1, 2)
+	inactiveTabStyle = lipgloss.NewStyle().Border(tabBorder, true).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	activeTabStyle   = lipgloss.NewStyle().Border(activeTabBorder, true).BorderForeground(lipgloss.Color("205")).Padding(0, 1)
+	windowStyle      = lipgloss.NewStyle().Border(tabBorder).BorderForeground(lipgloss.Color("205")).Padding(2, 2)
+	statusBarStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	helpStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	titleStyle       = lipgloss.NewStyle().Background(lipgloss.Color("205")).Foreground(lipgloss.Color("0")).Padding(0, 1)
+	buttonStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Padding(0, 3)
+	highlightColor   = lipgloss.Color("205")
 )
 
 // ----- Key Map ----------------------------------------------------------------
 
 type KeyMap struct {
-	Tab1         key.Binding
-	Tab2         key.Binding
-	Tab3         key.Binding
-	Enter        key.Binding
-	Escape       key.Binding
-	Delete       key.Binding
-	PauseResume  key.Binding
-	Retry        key.Binding
-	EditQueue    key.Binding
-	DeleteQueue  key.Binding
-	AddQueue     key.Binding
-	Up           key.Binding
-	Down         key.Binding
-	Left         key.Binding
-	Tab          key.Binding
-	Help         key.Binding
-	Quit         key.Binding
+	Tab1        key.Binding
+	Tab2        key.Binding
+	Tab3        key.Binding
+	Enter       key.Binding
+	Escape      key.Binding
+	Delete      key.Binding
+	PauseResume key.Binding
+	Retry       key.Binding
+	EditQueue   key.Binding
+	DeleteQueue key.Binding
+	AddQueue    key.Binding
+	Up          key.Binding
+	Down        key.Binding
+	Left        key.Binding
+	Tab         key.Binding
+	Help        key.Binding
+	Quit        key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -162,7 +164,7 @@ type Model struct {
 	keys      KeyMap
 	help      help.Model
 	showHelp  bool
-
+	mu        sync.Mutex
 	// Tab 1: Add Download form fields
 	urlInput      textinput.Model
 	folderInput   textinput.Model
@@ -177,14 +179,14 @@ type Model struct {
 	selectedQueue int
 
 	// For editing queue settings
-	editQueueMode       bool
-	editQueueIndex      int
-	queueEditFormFocus  int
-	queueNameInput      textinput.Model
-	queueFolderInput    textinput.Model
-	queueMaxDlInput     textinput.Model
-	queueSpeedInput     textinput.Model
-	queueTimeInput      textinput.Model
+	editQueueMode      bool
+	editQueueIndex     int
+	queueEditFormFocus int
+	queueNameInput     textinput.Model
+	queueFolderInput   textinput.Model
+	queueMaxDlInput    textinput.Model
+	queueSpeedInput    textinput.Model
+	queueTimeInput     textinput.Model
 
 	errorMsg string
 }
@@ -196,6 +198,7 @@ type QueueUI struct {
 	Folder       string
 	MaxDownloads int
 	SpeedLimit   string
+	Threads      uint8
 	TimeWindow   string
 }
 
@@ -249,29 +252,31 @@ func initialModel() Model {
 		Folder:       "Downloads",
 		MaxDownloads: 3,
 		SpeedLimit:   "Unlimited",
+		Threads:      3,
 		TimeWindow:   "Always",
 	})
 
 	return Model{
-		tabs:                []string{"Add Download", "Downloads List", "Queues List"},
-		activeTab:           0,
-		keys:                keys,
-		help:                helpModel,
-		urlInput:            urlInput,
-		folderInput:         folderInput,
-		filenameInput:       filenameInput,
-		addFormFocus:        0,
-		selectedDownload:    0,
-		queues:              queues,
-		selectedQueue:       0,
-		editQueueMode:       false,
-		editQueueIndex:      -1,
-		queueEditFormFocus:  0,
-		queueNameInput:      queueNameInput,
-		queueFolderInput:    queueFolderInput,
-		queueMaxDlInput:     queueMaxDlInput,
-		queueSpeedInput:     queueSpeedInput,
-		queueTimeInput:      queueTimeInput,
+		mu: sync.Mutex{},
+		tabs:               []string{"Add Download", "Downloads List", "Queues List"},
+		activeTab:          0,
+		keys:               keys,
+		help:               helpModel,
+		urlInput:           urlInput,
+		folderInput:        folderInput,
+		filenameInput:      filenameInput,
+		addFormFocus:       0,
+		selectedDownload:   0,
+		queues:             queues,
+		selectedQueue:      0,
+		editQueueMode:      false,
+		editQueueIndex:     -1,
+		queueEditFormFocus: 0,
+		queueNameInput:     queueNameInput,
+		queueFolderInput:   queueFolderInput,
+		queueMaxDlInput:    queueMaxDlInput,
+		queueSpeedInput:    queueSpeedInput,
+		queueTimeInput:     queueTimeInput,
 	}
 }
 
@@ -461,9 +466,7 @@ func (m Model) updateDownloadsListTab(msg tea.Msg) Model {
 		case key.Matches(msg, m.keys.Retry):
 			if len(tasks) > 0 && m.selectedDownload < len(tasks) {
 				t := tasks[m.selectedDownload]
-				if t.Status() == task.Failed {
-					t.Resume()
-				}
+				t.Cancel()
 			}
 		}
 	}
@@ -906,12 +909,12 @@ func truncateString(s string, maxLen int) string {
 // ----- main -------------------------------------------------------------------
 
 func main() {
-	//level := new(slog.LevelVar)
-	//level.Set(slog.LevelDebug)
-	//logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-	//	Level: level,
-	//}))
-	//slog.SetDefault(logger)
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelError)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+	}))
+	slog.SetDefault(logger)
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Println("Error running program:", err)
