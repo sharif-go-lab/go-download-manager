@@ -64,6 +64,7 @@ This project is a **Download Manager** implemented in **Golang** with a **Text-B
 To start the **Download Manager**, run:
 
 ```sh
+cd cmd
 go run main.go
 ```
 
