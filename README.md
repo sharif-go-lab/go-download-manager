@@ -51,8 +51,8 @@ This project is a **Download Manager** implemented in **Golang** with a **Text-B
 - Install **Go (>=1.18)**
 - Clone the repository:
   ```sh
-  git clone https://github.com/nimaazarr/DM.git
-  cd DM
+  git clone https://github.com/sharif-go-lab/go-download-manager.git
+  cd go-download-manager
   ```
 - Install dependencies:
   ```sh
