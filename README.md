@@ -38,7 +38,7 @@ This project is a **Download Manager** implemented in **Golang** with a **Text-B
 ## Technologies & Concepts
 
 - **Concurrency in Golang** (Goroutines & Channels for parallel downloads).
-- **TUI Implementation** (Using `tview` or `bubble tea`).
+- **TUI Implementation** (Using `bubble tea`).
 - **Networking & File Handling** (HTTP requests and multi-part downloads using `Accept-Ranges`).
 - **Golang Structs & Methods** (For managing downloads and queues efficiently).
 - **Error Handling & Retries** (Automatic and manual retry options).
@@ -83,49 +83,30 @@ go run main.go
 ```
 download-manager/
 │── cmd/                # CLI application entry point
-│   ├── main.go         # Main execution file
+│   ├── main.go         # Main execution file, initializes components and runs the TUI
 │
 │── internal/           # Core business logic (not exposed outside)
-│   ├── download/       # Download management logic
-│   │   ├── manager.go  # Handles multiple downloads
-│   │   ├── worker.go   # Concurrent worker logic
-│   │   ├── queue.go    # Queue management (pause/resume/download scheduling)
-│   │   ├── file.go     # File operations
-│   │   ├── speed.go    # Speed control & rate limiting
-│   │   ├── schedule.go # Handles scheduled downloads
-│   │
-│   ├── tui/            # Text-based UI logic
-│   │   ├── app.go      # Main TUI application logic
-│   │   ├── layout.go   # TUI layout and widgets
-│   │   ├── event.go    # Handles key bindings and events
-│   │
-│   ├── config/         # Configuration and settings
+│   ├── config/         # Configuration management
 │   │   ├── config.go   # Reads and manages application settings
+│   │   ├── config.yaml # Configuration file storing default settings
 │   │
-│   ├── utils/          # Utility functions
-│   │   ├── logger.go   # Logging utilities
-│   │   ├── helpers.go  # Miscellaneous helpers
+│   ├── queue/          # Download queue management
+│   │   ├── queue.go    # Implements queue logic for managing downloads
+│   │
+│   ├── task/           # Individual download task handling
+│   │   ├── task.go     # Defines and manages download tasks
+│   │
+│   ├── tui/            # Text-based UI logic (Bubble Tea-based)
+│   │   ├── tui.go      # Handles user interface interactions and rendering
+│   │
+│   ├── utils/          # Utility functions used across the project
+│   │   ├── file.go     # File-related utilities (path handling, file operations)
+│   │   ├── time.go     # Time-related utility functions
 │
-│── api/                # Optional: API server for remote control
-│   ├── server.go       # HTTP server for controlling downloads remotely
-│   ├── routes.go       # API route handlers
-│
-│── pkg/                # Reusable packages (if needed)
-│   ├── network/        # Networking utilities
-│   ├── storage/        # File storage and handling
-│
-│── scripts/            # Scripts for automation
-│   ├── build.sh        # Script to build the project
-│   ├── test.sh         # Script to run tests
-│
-│── test/               # Test files
-│   ├── download_test.go  # Tests for the download logic
-│   ├── tui_test.go       # Tests for the TUI logic
-│
-│── .env                # Environment variables (if needed)
-│── .gitignore          # Git ignore file
-│── go.mod              # Go module file
-│── go.sum              # Go dependencies checksum
+│── .gitignore          # Specifies files and directories to be ignored by Git
+│── go.mod              # Go module definition file
+│── go.sum              # Dependencies checksum file
+│── LICENSE             # Project license file
 │── README.md           # Documentation
 ```
 
