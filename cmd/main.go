@@ -504,21 +504,24 @@ func (m Model) updateTabAdd(msg tea.Msg) (Model, tea.Cmd) {
 					// Add to whichever queue is selected
 					if m.selectedQForAdd < len(m.realQueues) {
 						chosenQ := m.realQueues[m.selectedQForAdd]
-						chosenQ.AddTask(m.urlInput.Value(), m.folderInput.Value())
-						// If your queue supports specifying folder/filename, pass them too:
-						// chosenQ.AddTaskWithDetails(m.urlInput.Value(), m.folderInput.Value(), m.filenameInput.Value())
+						err := chosenQ.AddTask(m.urlInput.Value(), m.folderInput.Value())
+						if err != nil {
+						m.errorMsg = err.Error()
+					}else {
+							// Reset
+							m.urlInput.Reset()
+							m.folderInput.Reset()
+							m.filenameInput.Reset()
+							m.urlInput.Focus()
+							m.addFormFocus = 0
+							m.selectedQForAdd = 0
+
+							// Switch to downloads tab
+							m.activeTab = 1
+						}
 					}
 
-					// Reset
-					m.urlInput.Reset()
-					m.folderInput.Reset()
-					m.filenameInput.Reset()
-					m.urlInput.Focus()
-					m.addFormFocus = 0
-					m.selectedQForAdd = 0
 
-					// Switch to downloads tab
-					m.activeTab = 1
 				}
 			}
 

@@ -11,11 +11,11 @@ type TimeInterval struct {
 }
 
 func NewTimeInterval(start, end string) (*TimeInterval, error) {
-	startTime, err := time.Parse("12:00:00", start)
+	startTime, err := time.Parse("15:04:05", start)
 	if err != nil {
 		return nil, err
 	}
-	endTime, err := time.Parse("12:00:00", end)
+	endTime, err := time.Parse("15:04:05", end)
 	if err != nil {
 		return nil, err
 	}

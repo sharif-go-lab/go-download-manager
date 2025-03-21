@@ -15,7 +15,7 @@ import (
 
 type DownloadStatus int
 const (
-	Created DownloadStatus = iota
+	Pending DownloadStatus = iota
 	InProgress
 	Paused
 	Completed
@@ -24,9 +24,9 @@ const (
 )
 
 type Task struct {
-	url string
-	directoryPath string
-	status DownloadStatus
+	url           string
+	DirectoryPath string
+	status        DownloadStatus
 
 	fileSize int64
 	filePath string
@@ -44,10 +44,10 @@ type Task struct {
 
 func NewTask(url, directoryPath string, threads, retires uint8, limiter <-chan time.Time) *Task {
 	return &Task{
-		url: url,
-		status: Created,
-		retries: retires,
-		directoryPath: directoryPath,
+		url:           url,
+		status:        Pending,
+		retries:       retires,
+		DirectoryPath: directoryPath,
 
 		fileSize: -1,
 		threads: threads,
@@ -55,7 +55,9 @@ func NewTask(url, directoryPath string, threads, retires uint8, limiter <-chan t
 		downloaded: make([]uint64, threads),
 	}
 }
-
+func (t *Task)setDirectory(directory string)  {
+	t.DirectoryPath = directory
+}
 func (t *Task) start() {
 	t.mutex.Lock()
 	if t.status == InProgress {
@@ -79,9 +81,14 @@ func (t *Task) start() {
 		for try := uint8(0); try <= t.retries; try++ {
 			resp, err := http.Head(t.url)
 			if err == nil {
-				t.filePath = filepath.Join(t.directoryPath, utils.FileName(resp))
+				t.filePath = filepath.Join(t.DirectoryPath, utils.FileName(resp))
 				t.fileSize = resp.ContentLength
-
+				if _, err := os.Stat(t.filePath); err == nil {
+					// If file already exists, pick a unique name:
+					newPath := utils.FindUniqueFilePath(t.filePath)
+					//	slog.Debug(fmt.Sprintf("task %s exists, using new name %s", t.filePath, newPath))
+					t.filePath = newPath
+				}
 				slog.Debug(fmt.Sprintf("task %s | retry %d | file size: %d", t.filePath, try, t.fileSize))
 				break
 			}
@@ -95,6 +102,15 @@ func (t *Task) start() {
 		}
 	}
 	chunkSize := t.fileSize / int64(t.threads)
+
+	//if t.status != Paused {
+	//if _, err := os.Stat(t.filePath); err == nil {
+		// If file already exists, pick a unique name:
+		//newPath := utils.FindUniqueFilePath(t.filePath)
+	//	slog.Debug(fmt.Sprintf("task %s exists, using new name %s", t.filePath, newPath))
+	//	t.filePath = newPath
+	//}
+	//}
 
 	file, err := os.OpenFile(t.filePath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
@@ -190,11 +206,17 @@ func (t *Task) start() {
 	for i := 0; i < int(t.threads); i++ {
 		if !done[i] {
 			slog.Error(fmt.Sprintf("task %s | thread %d failed", t.filePath, i+1))
-			t.status = Failed
+			t.mutex.Lock()
+			if t.status == InProgress {
+				t.status = Failed
+			}
+			t.mutex.Unlock()
 			return
 		}
 	}
+	t.mutex.Lock()
 	t.status = Completed
+	t.mutex.Unlock()
 	slog.Info(fmt.Sprintf("task %s | download finished!", t.filePath))
 }
 
@@ -210,8 +232,8 @@ func (t *Task) Pause() {
 
 func (t *Task) Resume() {
 	t.mutex.Lock()
-	if t.status == Paused || t.status == Created {
-		if t.status == Created {
+	if t.status == Paused || t.status == Pending {
+		if t.status == Pending {
 			slog.Info("new task started!")
 		} else {
 			slog.Info(fmt.Sprintf("task %s | resumed", t.filePath))
@@ -233,6 +255,15 @@ func (t *Task) Cancel() {
 	}
 	t.mutex.Unlock()
 }
+
+//func (t *Task)Retry()  {
+//	//t.mutex.Loc
+//	t.Cancel()
+//	t.cancelFunc()
+//	t.start()
+//	//t.mutex.Unlock()
+//
+//}
 
 func (t *Task) Url() string {
 	return t.url
